@@ -1,0 +1,171 @@
+﻿FUNCTION_BLOCK "NET_DRIVE_MB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      port : PORT;//порт используемый на ПЛК
+      band : UDInt; //скорость обмена, должна быть равна на всех устройствах
+	  quantity_FC : Int; // колличество опрашиваемых регистров оборудования  
+	  time_PAUSE : Time; //время паузы между опросами минимально 15 мс
+	  time_SURVEY : Time; //время опроса минимально 15 мс
+   END_VAR
+
+   VAR_IN_OUT
+    addres_RG : Array[1..32] of UDInt; // массив адресов регистров 
+	MB_DATA : UInt; // указатель на область памяти, буффер
+	WRITE_SPEED : Array[1..32] of Int; // то что записывается 
+   END_VAR
+
+   VAR 
+      NETWORK_CONNECT {InstructionName := 'MB_COMM_LOAD'; LibVersion := '2.1'} : MB_COMM_LOAD; //блок установления соедиения, срабатывает при запуске контролера
+      EXCHANGE {InstructionName := 'MB_MASTER'; LibVersion := '2.2'} : MB_MASTER; //блок обмена по сети мотбас 
+      DEVICE_ADDRESS { S7_SetPoint := 'True'} : UInt; // адрес опрашиваемого устройства в сети мотбас
+      MODE : USInt; // мод запись/чтение 1 или 0
+      ADDR : UDInt; // адрес регистра на устройстве
+      pulse_SURVEY : Bool;//сигнал опроса по мотбасу
+      PULSE {InstructionName := 'TP_TIME'; LibVersion := '1.0'} : TP_TIME; //время чтения
+      DELAY {InstructionName := 'TON_TIME'; LibVersion := '1.0'} : TON_TIME; //время запуска
+      step { S7_SetPoint := 'True'} : UInt; // счетчик автомата для перехода по регистрам
+      write_active : Bool; // режим записи
+      write_case : UInt; // переход между девайсами
+      i { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'} : UInt; // счетчик регистров
+      temp_value : DInt;  // Исправлено: DINT вместо LWORD — поддержка во всех контроллерах
+	  READ_SPEED : Array[1..32] of Int; // то что читает 
+   END_VAR
+
+
+BEGIN
+
+    IF #quantity_FC > 32 THEN
+        #quantity_FC :=32;
+    ELSIF #quantity_FC < 1 THEN
+        #quantity_FC := 1;
+    END_IF;
+
+    REGION Таймеры и формирование REQ
+	    #PULSE(IN := #DELAY.Q,
+	           PT := #time_SURVEY);
+	    #DELAY(IN := NOT #PULSE.Q,
+	           PT := #time_PAUSE);
+	    
+	    #pulse_SURVEY := #PULSE.Q AND NOT #EXCHANGE.BUSY;
+	 END_REGION
+
+
+	REGION соединение
+	    
+	    // Инициализация порта (вызывается по FirstScan)
+	    #NETWORK_CONNECT(REQ := "FirstScan",
+	                     "PORT" := #port,
+	                     BAUD := #band,
+	                     PARITY := 0,
+	                     FLOW_CTRL := 0,
+	                     RTS_ON_DLY := 0,
+	                     RTS_OFF_DLY := 0,
+	                     RESP_TO := 1000,
+	                     MB_DB := #EXCHANGE);
+	    
+	END_REGION
+
+    REGION обмен
+	    #EXCHANGE(REQ := #pulse_SURVEY,
+	              MB_ADDR := #DEVICE_ADDRESS,
+	              MODE := #MODE,
+	              DATA_ADDR := #ADDR,
+	              DATA_LEN := 1,
+	              BUSY => #EXCHANGE.BUSY,
+	              DATA_PTR := #MB_DATA);
+	END_REGION
+
+
+	REGION Проверка необходимости ЗАПИСИ (Порегистрово)
+	    IF NOT #EXCHANGE.BUSY AND NOT #pulse_SURVEY AND NOT #write_active THEN
+	        
+	        // Проверяем скорость 
+	        FOR #i := 1 TO #quantity_FC DO
+	            IF #READ_SPEED[#i] <> #WRITE_SPEED[#i] THEN
+	                #DEVICE_ADDRESS := #i;
+	                #ADDR := #addres_RG[#i];
+	                #MODE := 1;
+	                
+	                // Защита от переполнения: speed * 100 → max = 65535
+	                #temp_value := INT_TO_DINT(#WRITE_SPEED[#i]) * 100;
+	                IF #temp_value > 65535 THEN
+	                    #temp_value := 65535;
+	                ELSIF #temp_value < 0 THEN
+	                    #temp_value := 0;  // защита от отрицательных значений
+	                END_IF;
+	                #MB_DATA := DINT_TO_UInt(#temp_value);
+	                
+	                #write_active := TRUE;
+	                #write_case := #i;
+	                EXIT;
+	            END_IF;
+	        END_FOR;
+	        
+	    END_IF;
+	END_REGION
+	
+	REGION Циклический ОПРОС (Порегистрово)
+	    IF NOT #EXCHANGE.BUSY AND NOT #pulse_SURVEY AND NOT #write_active THEN
+	        
+	        #MODE := 0; // Чтение
+	        
+	        // Коррекция шагов 
+	        IF #step > #quantity_FC - 1 THEN
+	            #step := 0;
+	        END_IF;
+
+			IF #step <= #quantity_FC THEN
+                #DEVICE_ADDRESS := #step + 1;
+	            #ADDR := #addres_RG[#step + 1]; 
+				#READ_SPEED[#step + 1] := UINT_TO_INT(#MB_DATA) / 100;
+			ELSE
+			   	#DEVICE_ADDRESS := 1;
+	            #ADDR := #addres_RG[1]; 
+				#READ_SPEED[1] := UINT_TO_INT(#MB_DATA) / 100;
+			END_IF;	
+	    END_IF;
+	END_REGION
+	
+
+
+	
+	REGION обработка результатов (DONE / ERROR)
+	    IF #EXCHANGE.DONE THEN
+	        
+	        IF #MODE = 0 THEN
+	            
+	            // Переход к следующему регистру — с гарантией цикличности
+	            #step := #step + 1;
+	            IF #step > #quantity_FC - 1 THEN
+	                #step := 0;
+	            END_IF;
+	            
+	        ELSIF #MODE = 1 THEN
+	            // ------------------ ПОДТВЕРЖДЕНИЕ ЗАПИСИ ------------------
+	            IF #write_case = 1 OR #write_case = 2 THEN
+	                #READ_SPEED[#step + 1] := #WRITE_SPEED[#step + 1];
+	            END_IF;
+	            
+	            #write_active := FALSE; // Освобождаем шину
+	        END_IF;
+	        
+	    END_IF;
+	    
+	    // Если устройство выдало ошибку
+	    IF #EXCHANGE.ERROR THEN
+	        IF #MODE = 0 THEN
+	            // Пропускаем регистр и идём дальше — безопасный инкремент с циклом
+	            #step := #step + 1;
+	            IF #step > #quantity_FC - 1 THEN
+	                #step := 0;
+	            END_IF;
+	        ELSE
+	            #write_active := FALSE; // Сбрасываем флаг записи при неудаче
+	        END_IF;
+	    END_IF;
+	END_REGION
+	
+	
+END_FUNCTION_BLOCK
+
